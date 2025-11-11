@@ -20,34 +20,35 @@ class HeightScanEncoder(nn.Module):
 
     def __init__(self, input_shape: tuple[int, int], out_features: int) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 1, kernel_size=3, dilation=1, padding=0, bias=True)
-        self.bn1 = nn.BatchNorm2d(1)
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=3, dilation=1, padding=1, stride=2, padding_mode="replicate", bias=True)
+        self.bn1 = nn.BatchNorm2d(8)
         self.relu1 = nn.ReLU(inplace=True)
 
-        self.conv2 = nn.Conv2d(1, 1, kernel_size=3, dilation=2, padding=0, bias=True)
-        self.bn2 = nn.BatchNorm2d(1)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, dilation=2, padding=2, stride=2, padding_mode="replicate", bias=True)
+        self.bn2 = nn.BatchNorm2d(16)
         self.relu2 = nn.ReLU(inplace=True)
 
-        self.conv3 = nn.Conv2d(1, 1, kernel_size=3, dilation=3, padding=0, bias=True)
-        self.bn3 = nn.BatchNorm2d(1)
+        self.conv3 = nn.Conv2d(16, 32, kernel_size=3, dilation=3, padding=3, stride=2, padding_mode="replicate", bias=True)
+        self.bn3 = nn.BatchNorm2d(32)
         self.relu3 = nn.ReLU(inplace=True)
 
         self.shortcut1 = nn.Sequential(
-            nn.Conv2d(1, 1, kernel_size=3, padding=0, bias=True),
-            nn.BatchNorm2d(1),
-        )
-        self.shortcut2 = nn.Sequential(
-            nn.Conv2d(1, 1, kernel_size=7, padding=0, bias=True),
-            nn.BatchNorm2d(1),
-        )
-        self.shortcut3 = nn.Sequential(
-            nn.Conv2d(1, 1, kernel_size=13, padding=0, bias=True),
-            nn.BatchNorm2d(1),
+            nn.Conv2d(1, 8, kernel_size=1, padding=0, stride=2, bias=True),
+            nn.BatchNorm2d(8),
         )
 
-        self.flat_dim = 1
-        self.pool = nn.AdaptiveMaxPool2d((1, 1))
-        self.fc = nn.Linear(self.flat_dim, out_features)
+        self.shortcut2 = nn.Sequential(
+            nn.Conv2d(8, 16, kernel_size=1, padding=0, stride=2, bias=True),
+            nn.BatchNorm2d(16),
+        )
+
+        self.shortcut3 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=1, padding=0, stride=2, bias=True),
+            nn.BatchNorm2d(32),
+        )
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(self.conv3.out_channels, out_features)
         self.out_features = out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -57,12 +58,12 @@ class HeightScanEncoder(nn.Module):
         out2 = self.relu1(out1)
         out2 = self.conv2(out2)
         out2 = self.bn2(out2)
-        out2 = out2 + self.shortcut2(x)
+        out2 = out2 + self.shortcut2(out1)
         out3 = self.conv3(out2)
         out3 = self.bn3(out3)
-        out3 = out3 + self.shortcut3(x)
+        out3 = out3 + self.shortcut3(out2)
         out3 = self.relu3(out3)
-        out3 = self.pool(out3)
+        out3 = self.avgpool(out3)
         out3 = torch.flatten(out3, 1)
         out3 = self.fc(out3)
         return out3
