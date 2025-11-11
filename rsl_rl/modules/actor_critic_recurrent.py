@@ -45,7 +45,7 @@ class HeightScanEncoder(nn.Module):
             nn.BatchNorm2d(1),
         )
 
-        self.flat_dim = 3
+        self.flat_dim = 1
         self.pool = nn.AdaptiveMaxPool2d((1, 1))
         self.fc = nn.Linear(self.flat_dim, out_features)
         self.out_features = out_features
@@ -57,10 +57,10 @@ class HeightScanEncoder(nn.Module):
         out2 = self.relu1(out1)
         out2 = self.conv2(out2)
         out2 = self.bn2(out2)
-        out2 = out2 + self.shortcut2(out1)
+        out2 = out2 + self.shortcut2(x)
         out3 = self.conv3(out2)
         out3 = self.bn3(out3)
-        out3 = out3 + self.shortcut3(out2)
+        out3 = out3 + self.shortcut3(x)
         out3 = self.relu3(out3)
         out3 = self.pool(out3)
         out3 = torch.flatten(out3, 1)
@@ -125,11 +125,8 @@ class ActorCriticRecurrent(ActorCritic):
         encoded_actor_obs_dim = num_actor_obs - self.num_height_scan_points + self.encoder_out_dim
         encoded_critic_obs_dim = num_critic_obs - self.num_height_scan_points + self.encoder_out_dim
 
-        # self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        # self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        
-        self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
         print(f"Actor RNN: {self.memory_a}")
         print(f"Critic RNN: {self.memory_c}")
@@ -139,17 +136,17 @@ class ActorCriticRecurrent(ActorCritic):
         self.memory_c.reset(dones)
 
     def act(self, observations, masks=None, hidden_states=None):
-        # observations = self.encode_observations(observations)
+        observations = self.encode_observations(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
-        # observations = self.encode_observations(observations)
+        observations = self.encode_observations(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
-        # critic_observations = self.encode_observations(critic_observations)
+        critic_observations = self.encode_observations(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 
