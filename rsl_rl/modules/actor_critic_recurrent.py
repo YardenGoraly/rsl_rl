@@ -47,7 +47,7 @@ class HeightScanEncoder(nn.Module):
             nn.BatchNorm2d(32),
         )
 
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.maxpool = nn.AdaptiveMaxPool2d((1, 1))
         self.fc = nn.Linear(self.conv3.out_channels, out_features)
         self.out_features = out_features
 
@@ -63,7 +63,7 @@ class HeightScanEncoder(nn.Module):
         out3 = self.bn3(out3)
         out3 = out3 + self.shortcut3(out2)
         out3 = self.relu3(out3)
-        out3 = self.avgpool(out3)
+        out3 = self.maxpool(out3)
         out3 = torch.flatten(out3, 1)
         out3 = self.fc(out3)
         return out3
@@ -117,17 +117,20 @@ class ActorCriticRecurrent(ActorCritic):
         self.height_scan_x = int(round(self.height_scan_size[0] / self.height_scan_resolution)) + 1
         self.height_scan_y = int(round(self.height_scan_size[1] / self.height_scan_resolution)) + 1
 
-        self.CNN_encoder = HeightScanEncoder(
-            input_shape=(self.height_scan_x, self.height_scan_y),
-            out_features=34,
-        )
-        self.encoder_out_dim = self.CNN_encoder.out_features
+        # self.CNN_encoder = HeightScanEncoder(
+        #     input_shape=(self.height_scan_x, self.height_scan_y),
+        #     out_features=34,
+        # )
+        # self.encoder_out_dim = self.CNN_encoder.out_features
 
-        encoded_actor_obs_dim = num_actor_obs - self.num_height_scan_points + self.encoder_out_dim
-        encoded_critic_obs_dim = num_critic_obs - self.num_height_scan_points + self.encoder_out_dim
+        # encoded_actor_obs_dim = num_actor_obs - self.num_height_scan_points + self.encoder_out_dim
+        # encoded_critic_obs_dim = num_critic_obs - self.num_height_scan_points + self.encoder_out_dim
 
-        self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+
+        self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
         print(f"Actor RNN: {self.memory_a}")
         print(f"Critic RNN: {self.memory_c}")
@@ -137,17 +140,17 @@ class ActorCriticRecurrent(ActorCritic):
         self.memory_c.reset(dones)
 
     def act(self, observations, masks=None, hidden_states=None):
-        observations = self.encode_observations(observations)
+        # observations = self.encode_observations(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
-        observations = self.encode_observations(observations)
+        # observations = self.encode_observations(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
-        critic_observations = self.encode_observations(critic_observations)
+        # critic_observations = self.encode_observations(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 

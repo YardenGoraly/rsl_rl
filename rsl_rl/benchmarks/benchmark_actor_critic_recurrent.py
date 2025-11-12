@@ -14,6 +14,8 @@ def benchmark_actor_critic_recurrent(device="cuda" if torch.cuda.is_available() 
         rnn_num_layers=1,
         activation="elu",
     ).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
     model.eval()    # Test configurations
     batch_sizes = [1, 1000]
     warmup_passes = 10
