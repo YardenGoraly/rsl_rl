@@ -20,31 +20,31 @@ class HeightScanEncoder(nn.Module):
 
     def __init__(self, input_shape: tuple[int, int], out_features: int) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 8, kernel_size=3, dilation=1, padding=1, stride=2, padding_mode="replicate", bias=True)
-        self.bn1 = nn.BatchNorm2d(8)
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, dilation=1, padding=1, stride=2, padding_mode="replicate", bias=True)
+        self.bn1 = nn.BatchNorm2d(16)
         self.relu1 = nn.ReLU(inplace=True)
 
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, dilation=2, padding=2, stride=2, padding_mode="replicate", bias=True)
-        self.bn2 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, dilation=2, padding=2, stride=2, padding_mode="replicate", bias=True)
+        self.bn2 = nn.BatchNorm2d(32)
         self.relu2 = nn.ReLU(inplace=True)
 
-        self.conv3 = nn.Conv2d(16, 32, kernel_size=3, dilation=3, padding=3, stride=2, padding_mode="replicate", bias=True)
-        self.bn3 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, dilation=3, padding=3, stride=2, padding_mode="replicate", bias=True)
+        self.bn3 = nn.BatchNorm2d(64)
         self.relu3 = nn.ReLU(inplace=True)
 
         self.shortcut1 = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=1, padding=0, stride=2, bias=True),
-            nn.BatchNorm2d(8),
-        )
-
-        self.shortcut2 = nn.Sequential(
-            nn.Conv2d(8, 16, kernel_size=1, padding=0, stride=2, bias=True),
+            nn.Conv2d(1, 16, kernel_size=1, padding=0, stride=2, bias=True),
             nn.BatchNorm2d(16),
         )
 
-        self.shortcut3 = nn.Sequential(
+        self.shortcut2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=1, padding=0, stride=2, bias=True),
             nn.BatchNorm2d(32),
+        )
+
+        self.shortcut3 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=1, padding=0, stride=2, bias=True),
+            nn.BatchNorm2d(64),
         )
 
         self.maxpool = nn.AdaptiveMaxPool2d((1, 1))
@@ -59,7 +59,8 @@ class HeightScanEncoder(nn.Module):
         out2 = self.conv2(out2)
         out2 = self.bn2(out2)
         out2 = out2 + self.shortcut2(out1)
-        out3 = self.conv3(out2)
+        out3 = self.relu2(out2)
+        out3 = self.conv3(out3)
         out3 = self.bn3(out3)
         out3 = out3 + self.shortcut3(out2)
         out3 = self.relu3(out3)
@@ -67,6 +68,26 @@ class HeightScanEncoder(nn.Module):
         out3 = torch.flatten(out3, 1)
         out3 = self.fc(out3)
         return out3
+
+class PositionEncoder(nn.Module):
+    def __init__(self, input_shape: tuple[int, int], out_features: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(1, 1, kernel_size=3, dilation=1, padding=1, stride=2, padding_mode="replicate", bias=True)
+        self.bn1 = nn.BatchNorm1d(1)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        self.maxpool = nn.AdaptiveMaxPool1d((1))
+        self.fc = nn.Linear(self.conv1.out_channels, out_features)
+        self.out_features = out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out1 = self.conv1(x)
+        out1 = self.bn1(out1)
+        out1 = self.relu1(out1)
+        out1 = self.maxpool(out1)
+        out1 = torch.flatten(out1, 1)
+        out1 = self.fc(out1)
+        return out1
 
 
 class ActorCriticRecurrent(ActorCritic):
@@ -111,26 +132,26 @@ class ActorCriticRecurrent(ActorCritic):
 
         activation = resolve_nn_activation(activation)
 
-        self.num_height_scan_points = 2501
+        self.num_height_scan_points = 651
         self.height_scan_size = (6, 4)
-        self.height_scan_resolution = 0.1
+        self.height_scan_resolution = 0.2
         self.height_scan_x = int(round(self.height_scan_size[0] / self.height_scan_resolution)) + 1
         self.height_scan_y = int(round(self.height_scan_size[1] / self.height_scan_resolution)) + 1
 
-        # self.CNN_encoder = HeightScanEncoder(
-        #     input_shape=(self.height_scan_x, self.height_scan_y),
-        #     out_features=34,
-        # )
-        # self.encoder_out_dim = self.CNN_encoder.out_features
+        self.CNN_encoder = HeightScanEncoder(
+            input_shape=(self.height_scan_x, self.height_scan_y),
+            out_features=34,
+        )
+        self.encoder_out_dim = self.CNN_encoder.out_features
 
-        # encoded_actor_obs_dim = num_actor_obs - self.num_height_scan_points + self.encoder_out_dim
-        # encoded_critic_obs_dim = num_critic_obs - self.num_height_scan_points + self.encoder_out_dim
+        encoded_actor_obs_dim = num_actor_obs - self.num_height_scan_points + self.encoder_out_dim
+        encoded_critic_obs_dim = num_critic_obs - self.num_height_scan_points + self.encoder_out_dim
 
-        # self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        # self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
-        self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
         print(f"Actor RNN: {self.memory_a}")
         print(f"Critic RNN: {self.memory_c}")
@@ -140,17 +161,17 @@ class ActorCriticRecurrent(ActorCritic):
         self.memory_c.reset(dones)
 
     def act(self, observations, masks=None, hidden_states=None):
-        # observations = self.encode_observations(observations)
+        observations = self.encode_observations(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
-        # observations = self.encode_observations(observations)
+        observations = self.encode_observations(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
-        # critic_observations = self.encode_observations(critic_observations)
+        critic_observations = self.encode_observations(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 
