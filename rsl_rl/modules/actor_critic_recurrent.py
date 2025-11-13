@@ -21,30 +21,35 @@ class HeightScanEncoder(nn.Module):
     def __init__(self, input_shape: tuple[int, int], out_features: int) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(1, 16, kernel_size=3, dilation=1, padding=1, stride=2, padding_mode="replicate", bias=True)
-        self.bn1 = nn.BatchNorm2d(16)
         self.relu1 = nn.ReLU(inplace=True)
 
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, dilation=2, padding=2, stride=2, padding_mode="replicate", bias=True)
-        self.bn2 = nn.BatchNorm2d(32)
         self.relu2 = nn.ReLU(inplace=True)
 
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, dilation=3, padding=3, stride=2, padding_mode="replicate", bias=True)
-        self.bn3 = nn.BatchNorm2d(64)
         self.relu3 = nn.ReLU(inplace=True)
+
+        h1, w1 = self._conv2d_output_shape(input_shape[0], input_shape[1], kernel_size=3, stride=2, padding=1, dilation=1)
+        h2, w2 = self._conv2d_output_shape(h1, w1, kernel_size=3, stride=2, padding=2, dilation=2)
+        h3, w3 = self._conv2d_output_shape(h2, w2, kernel_size=3, stride=2, padding=3, dilation=3)
+
+        self.ln1 = nn.LayerNorm([16, h1, w1])
+        self.ln2 = nn.LayerNorm([32, h2, w2])
+        self.ln3 = nn.LayerNorm([64, h3, w3])
 
         self.shortcut1 = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=1, padding=0, stride=2, bias=True),
-            nn.BatchNorm2d(16),
+            nn.LayerNorm([16, h1, w1]),
         )
 
         self.shortcut2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=1, padding=0, stride=2, bias=True),
-            nn.BatchNorm2d(32),
+            nn.LayerNorm([32, h2, w2]),
         )
 
         self.shortcut3 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=1, padding=0, stride=2, bias=True),
-            nn.BatchNorm2d(64),
+            nn.LayerNorm([64, h3, w3]),
         )
 
         self.maxpool = nn.AdaptiveMaxPool2d((1, 1))
@@ -52,22 +57,42 @@ class HeightScanEncoder(nn.Module):
         self.out_features = out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x - x.mean(dim=(-2, -1), keepdim=True)
+        x = x / (x.std(dim=(-2, -1), keepdim=True) + 1e-6)
+
         out1 = self.conv1(x)
-        out1 = self.bn1(out1)
+        out1 = self.ln1(out1)
         out1 = out1 + self.shortcut1(x)
         out2 = self.relu1(out1)
         out2 = self.conv2(out2)
-        out2 = self.bn2(out2)
+        out2 = self.ln2(out2)
         out2 = out2 + self.shortcut2(out1)
         out3 = self.relu2(out2)
         out3 = self.conv3(out3)
-        out3 = self.bn3(out3)
+        out3 = self.ln3(out3)
         out3 = out3 + self.shortcut3(out2)
         out3 = self.relu3(out3)
         out3 = self.maxpool(out3)
         out3 = torch.flatten(out3, 1)
         out3 = self.fc(out3)
         return out3
+
+    @staticmethod
+    def _conv2d_output_shape(
+        height: int,
+        width: int,
+        *,
+        kernel_size: int,
+        stride: int,
+        padding: int,
+        dilation: int,
+    ) -> tuple[int, int]:
+        """Compute the output height and width for a Conv2d layer."""
+
+        def _dim(size: int) -> int:
+            return (size + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+
+        return _dim(height), _dim(width)
 
 class PositionEncoder(nn.Module):
     def __init__(self, input_shape: tuple[int, int], out_features: int) -> None:
