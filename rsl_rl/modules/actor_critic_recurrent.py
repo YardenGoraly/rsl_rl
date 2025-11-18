@@ -15,104 +15,164 @@ from rsl_rl.networks import Memory
 from rsl_rl.utils import resolve_nn_activation
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int, dilation: int = 1) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=dilation,
+            dilation=dilation,
+            padding_mode="replicate",
+            bias=True,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = None
+
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=True),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.conv(x)
+        out = self.bn(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(identity)
+
+        out = out + identity
+        out = self.relu(out)
+        return out
+
+
 class HeightScanEncoder(nn.Module):
     """CNN encoder for the height-scan observation."""
 
-    def __init__(self, input_shape: tuple[int, int], out_features: int) -> None:
+    def __init__(
+        self,
+        input_shape: tuple[int, int],
+        out_features: int,
+        normalize: bool = True,
+        height_min: float = -1.0,
+        height_max: float = 0.5,
+    ) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, dilation=1, padding=1, stride=2, padding_mode="replicate", bias=True)
-        self.relu1 = nn.ReLU(inplace=True)
-
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, dilation=2, padding=2, stride=2, padding_mode="replicate", bias=True)
-        self.relu2 = nn.ReLU(inplace=True)
-
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, dilation=3, padding=3, stride=2, padding_mode="replicate", bias=True)
-        self.relu3 = nn.ReLU(inplace=True)
-
-        h1, w1 = self._conv2d_output_shape(input_shape[0], input_shape[1], kernel_size=3, stride=2, padding=1, dilation=1)
-        h2, w2 = self._conv2d_output_shape(h1, w1, kernel_size=3, stride=2, padding=2, dilation=2)
-        h3, w3 = self._conv2d_output_shape(h2, w2, kernel_size=3, stride=2, padding=3, dilation=3)
-
-        self.ln1 = nn.LayerNorm([16, h1, w1])
-        self.ln2 = nn.LayerNorm([32, h2, w2])
-        self.ln3 = nn.LayerNorm([64, h3, w3])
-
-        self.shortcut1 = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=1, padding=0, stride=2, bias=True),
-            nn.LayerNorm([16, h1, w1]),
-        )
-
-        self.shortcut2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=1, padding=0, stride=2, bias=True),
-            nn.LayerNorm([32, h2, w2]),
-        )
-
-        self.shortcut3 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=1, padding=0, stride=2, bias=True),
-            nn.LayerNorm([64, h3, w3]),
-        )
+        self.block1 = ResidualBlock(1, 4, stride=2, dilation=1)
+        self.block2 = ResidualBlock(4, 8, stride=2, dilation=2)
+        self.block3 = ResidualBlock(8, 16, stride=2, dilation=3)
 
         self.maxpool = nn.AdaptiveMaxPool2d((1, 1))
-        self.fc = nn.Linear(self.conv3.out_channels, out_features)
+        self.fc = nn.Linear(16, out_features)
         self.out_features = out_features
+        
+        # Normalization parameters
+        self.normalize = normalize
+        self.height_min = height_min  # Minimum expected height scan value
+        self.height_max = height_max  # Maximum expected height scan value
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x - x.mean(dim=(-2, -1), keepdim=True)
-        x = x / (x.std(dim=(-2, -1), keepdim=True) + 1e-6)
-
-        out1 = self.conv1(x)
-        out1 = self.ln1(out1)
-        out1 = out1 + self.shortcut1(x)
-        out2 = self.relu1(out1)
-        out2 = self.conv2(out2)
-        out2 = self.ln2(out2)
-        out2 = out2 + self.shortcut2(out1)
-        out3 = self.relu2(out2)
-        out3 = self.conv3(out3)
-        out3 = self.ln3(out3)
-        out3 = out3 + self.shortcut3(out2)
-        out3 = self.relu3(out3)
-        out3 = self.maxpool(out3)
-        out3 = torch.flatten(out3, 1)
-        out3 = self.fc(out3)
-        return out3
-
-    @staticmethod
-    def _conv2d_output_shape(
-        height: int,
-        width: int,
-        *,
-        kernel_size: int,
-        stride: int,
-        padding: int,
-        dilation: int,
-    ) -> tuple[int, int]:
-        """Compute the output height and width for a Conv2d layer."""
-
-        def _dim(size: int) -> int:
-            return (size + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
-
-        return _dim(height), _dim(width)
+        # Normalize height scan to [-1, 1] range
+        # For height scans with range [height_min, height_max], normalize to [-1, 1]:
+        # normalized = 2 * (x - height_min) / (height_max - height_min) - 1
+        if self.normalize:
+            # Clamp to expected range first to handle outliers
+            x_clamped = torch.clamp(x, min=self.height_min, max=self.height_max)
+            # Normalize to [-1, 1]
+            range_size = self.height_max - self.height_min
+            if range_size > 0:
+                x_normalized = 2.0 * (x_clamped - self.height_min) / range_size - 1.0
+            else:
+                x_normalized = x_clamped  # Avoid division by zero
+            x = x_normalized
+        
+        out = self.block1(x)
+        out = self.block2(out)
+        out = self.block3(out)
+        out = self.maxpool(out)
+        out = torch.flatten(out, 1)
+        out = self.fc(out)
+        return out
 
 class PositionEncoder(nn.Module):
-    def __init__(self, input_shape: tuple[int, int], out_features: int) -> None:
-        super().__init__()
-        self.conv1 = nn.Conv1d(1, 1, kernel_size=3, dilation=1, padding=1, stride=2, padding_mode="replicate", bias=True)
-        self.bn1 = nn.BatchNorm1d(1)
-        self.relu1 = nn.ReLU(inplace=True)
+    """1D CNN encoder for past position history.
+    
+    Processes past positions as a temporal sequence using 1D convolutions.
+    Input: flattened position history [batch, num_positions * 2] where each position is (x, y)
+    Output: encoded features [batch, out_features]
+    """
 
-        self.maxpool = nn.AdaptiveMaxPool1d((1))
-        self.fc = nn.Linear(self.conv1.out_channels, out_features)
+    def __init__(self, num_positions: int, out_features: int, normalize: bool = True) -> None:
+        super().__init__()
+        self.num_positions = num_positions
         self.out_features = out_features
+        self.normalize = normalize
+        
+        # Process x and y coordinates as separate channels (2 channels: x, y)
+        # Architecture: multiple 1D conv layers with increasing channels
+        self.conv1 = nn.Conv1d(2, 16, kernel_size=3, padding=1, padding_mode="replicate", bias=True)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.relu1 = nn.ReLU(inplace=True)
+        
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=3, padding=1, padding_mode="replicate", bias=True)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.relu2 = nn.ReLU(inplace=True)
+        
+        self.conv3 = nn.Conv1d(32, 64, kernel_size=3, padding=1, padding_mode="replicate", bias=True)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.relu3 = nn.ReLU(inplace=True)
+        
+        # Global max pooling to get fixed-size representation
+        self.maxpool = nn.AdaptiveMaxPool1d(1)
+        
+        # Final MLP layer
+        self.fc = nn.Linear(64, out_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out1 = self.conv1(x)
-        out1 = self.bn1(out1)
-        out1 = self.relu1(out1)
-        out1 = self.maxpool(out1)
-        out1 = torch.flatten(out1, 1)
-        out1 = self.fc(out1)
-        return out1
+        """
+        Args:
+            x: Flattened position history [batch, num_positions * 2]
+        Returns:
+            Encoded features [batch, out_features]
+        """
+        # Reshape from [batch, num_positions * 2] to [batch, 2, num_positions]
+        # Treating x and y as separate channels for the 1D conv
+        batch_size = x.shape[0]
+        x = x.view(batch_size, 2, self.num_positions)
+        
+        # Optional normalization (similar to height scan)
+        if self.normalize:
+            # Normalize each channel independently to [-1, 1]
+            # Assuming positions are in reasonable range (e.g., [-10, 10] meters)
+            x = torch.clamp(x, min=-10.0, max=10.0)
+            x = x / 10.0  # Normalize to [-1, 1]
+        
+        # 1D CNN layers
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu1(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu2(out)
+        
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out = self.relu3(out)
+        
+        # Global max pooling: [batch, 64, num_positions] -> [batch, 64, 1]
+        out = self.maxpool(out)
+        
+        # Flatten and final FC layer: [batch, 64, 1] -> [batch, 64] -> [batch, out_features]
+        out = torch.flatten(out, 1)
+        out = self.fc(out)
+        
+        return out
 
 
 class ActorCriticRecurrent(ActorCritic):
@@ -163,14 +223,53 @@ class ActorCriticRecurrent(ActorCritic):
         self.height_scan_x = int(round(self.height_scan_size[0] / self.height_scan_resolution)) + 1
         self.height_scan_y = int(round(self.height_scan_size[1] / self.height_scan_resolution)) + 1
 
+        # Height scan normalization parameters
+        # Should match your height_scan_clipped clip_height range (default: (-1.0, 0.5))
+        height_scan_normalize = kwargs.pop("height_scan_normalize", True)
+        height_scan_min = kwargs.pop("height_scan_min", -2.0)
+        height_scan_max = kwargs.pop("height_scan_max", 2.0)
+        
         self.CNN_encoder = HeightScanEncoder(
             input_shape=(self.height_scan_x, self.height_scan_y),
             out_features=34,
+            normalize=height_scan_normalize,
+            height_min=height_scan_min,
+            height_max=height_scan_max,
         )
         self.encoder_out_dim = self.CNN_encoder.out_features
 
-        encoded_actor_obs_dim = num_actor_obs - self.num_height_scan_points + self.encoder_out_dim
-        encoded_critic_obs_dim = num_critic_obs - self.num_height_scan_points + self.encoder_out_dim
+        # Past positions encoder parameters
+        # Calculate from config: max_distance=10.0, interval=0.2 -> num_positions = int(10.0/0.2) + 1 = 51
+        num_past_positions = kwargs.pop("num_past_positions", 51)  # Default from max_distance=10.0, interval=0.2
+        past_positions_out_features = kwargs.pop("past_positions_out_features", 16)  # Encoded feature size
+        past_positions_normalize = kwargs.pop("past_positions_normalize", True)
+        self.num_past_positions = num_past_positions
+        self.num_past_position_points = num_past_positions * 2  # Each position is (x, y)
+        
+        self.position_encoder = PositionEncoder(
+            num_positions=num_past_positions,
+            out_features=past_positions_out_features,
+            normalize=past_positions_normalize,
+        )
+        self.position_encoder_out_dim = self.position_encoder.out_features
+
+        # Calculate encoded observation dimensions
+        # Remove: height_scan (651) + past_positions (num_past_positions * 2)
+        # Add: CNN features (34) + position encoder features (past_positions_out_features)
+        encoded_actor_obs_dim = (
+            num_actor_obs 
+            - self.num_height_scan_points 
+            - self.num_past_position_points
+            + self.encoder_out_dim 
+            + self.position_encoder_out_dim
+        )
+        encoded_critic_obs_dim = (
+            num_critic_obs 
+            - self.num_height_scan_points 
+            - self.num_past_position_points
+            + self.encoder_out_dim 
+            + self.position_encoder_out_dim
+        )
 
         self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
         self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
@@ -204,12 +303,12 @@ class ActorCriticRecurrent(ActorCritic):
         return self.memory_a.hidden_states, self.memory_c.hidden_states
 
     def encode_observations(self, observations):
-        """Replace the flattened height-scan portion with CNN features while keeping the rest intact.
+        """Encode height-scan and past positions using CNNs while keeping the rest intact.
 
-        The segment starting at index 34 is reshaped into a 2-D grid, passed through
-        `HeightScanEncoder`, and the resulting features are spliced back into the
-        observation vector. Time-major inputs are flattened to batch-major for the
-        CNN and reshaped afterward.
+        The height-scan segment (starting at index 34) is reshaped into a 2-D grid and passed through
+        `HeightScanEncoder`. The past positions segment (after height-scan) is reshaped and passed
+        through `PositionEncoder`. Both encoded features are spliced back into the observation vector.
+        Time-major inputs are flattened to batch-major for the CNNs and reshaped afterward.
         """
         original_shape = observations.shape
         # Deal with end of episodes when observation dimension is 3
@@ -217,22 +316,33 @@ class ActorCriticRecurrent(ActorCritic):
             time_steps, batch_size, obs_dim = original_shape
             observations = observations.reshape(time_steps * batch_size, obs_dim)
 
-        # Extract height-scan portion and reshape for CNN
+        # Extract height-scan portion and reshape for 2D CNN
+        height_scan_start_idx = 34
+        height_scan_end_idx = height_scan_start_idx + self.num_height_scan_points
         CNN_input = (
-            observations[:, 34 : 34 + self.num_height_scan_points]
+            observations[:, height_scan_start_idx : height_scan_end_idx]
             .clone()
             .reshape(observations.shape[0], 1, self.height_scan_x, self.height_scan_y)
         )
 
-        # Pass through CNN encoder
-        recurrent_height_scan_input = self.CNN_encoder(CNN_input)
+        # Pass through height-scan CNN encoder
+        encoded_height_scan = self.CNN_encoder(CNN_input)
 
-        # Concatenate with original observations
+        # Extract past positions portion (comes after height-scan)
+        past_positions_start_idx = height_scan_end_idx
+        past_positions_end_idx = past_positions_start_idx + self.num_past_position_points
+        past_positions_input = observations[:, past_positions_start_idx : past_positions_end_idx].clone()
+
+        # Pass through position encoder (1D CNN)
+        encoded_past_positions = self.position_encoder(past_positions_input)
+
+        # Concatenate: [before_height_scan, encoded_height_scan, encoded_past_positions, after_past_positions]
         observations = torch.cat(
             [
-                observations[:, :34].clone(),
-                recurrent_height_scan_input,
-                observations[:, 34 + self.num_height_scan_points :].clone(),
+                observations[:, :height_scan_start_idx].clone(),  # Observations before height scan
+                encoded_height_scan,  # Encoded height scan features
+                encoded_past_positions,  # Encoded past positions features
+                observations[:, past_positions_end_idx:].clone(),  # Observations after past positions
             ],
             dim=1,
         )
