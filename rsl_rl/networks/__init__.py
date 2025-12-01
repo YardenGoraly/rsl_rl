@@ -6,6 +6,21 @@
 """Definitions for neural networks."""
 
 from .memory import Memory
-from .networks_misc import ResidualBlock, HeightScanEncoder, PositionEncoder
+from .networks_misc import (
+    ResidualBlock,
+    HeightScanEncoder,
+    PositionEncoder,
+    SpatialSelfAttention,
+    SpatialCrossAttention,
+    AttentionFeatureCompressor,
+)
 
-__all__ = ["Memory", "ResidualBlock", "HeightScanEncoder", "PositionEncoder"]
+__all__ = [
+    "Memory",
+    "ResidualBlock",
+    "HeightScanEncoder",
+    "PositionEncoder",
+    "SpatialSelfAttention",
+    "SpatialCrossAttention",
+    "AttentionFeatureCompressor",
+]

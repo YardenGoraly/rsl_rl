@@ -167,3 +167,189 @@ class PositionEncoder(nn.Module):
         
         return out
 
+
+class SpatialSelfAttention(nn.Module):
+    """Self-attention layer for spatial feature maps.
+    
+    Enriches each spatial feature with global context by computing attention weights
+    across spatial dimensions. Given a feature map F_t ∈ R^(C × H × W), produces
+    a refined feature map F'_t with the same dimensions.
+    
+    Args:
+        channels: Number of channels C in the feature map
+        num_heads: Number of attention heads (default: 8)
+        dropout: Dropout probability (default: 0.1)
+    """
+    
+    def __init__(self, channels: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        
+        assert channels % num_heads == 0, f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+        
+        # Linear projections for Q, K, V
+        self.qkv = nn.Linear(channels, channels * 3, bias=False)
+        self.proj = nn.Linear(channels, channels)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(channels)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Feature map [batch, C, H, W]
+        Returns:
+            Refined feature map [batch, C, H, W]
+        """
+        batch_size, C, H, W = x.shape
+        
+        # Reshape to [batch, H*W, C] for attention computation
+        x_flat = x.view(batch_size, C, H * W).permute(0, 2, 1)  # [batch, H*W, C]
+        
+        # Store residual
+        residual = x_flat
+        
+        # Layer norm
+        x_flat = self.norm(x_flat)
+        
+        # Compute Q, K, V
+        qkv = self.qkv(x_flat)  # [batch, H*W, 3*C]
+        qkv = qkv.reshape(batch_size, H * W, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, num_heads, H*W, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale  # [batch, num_heads, H*W, H*W]
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        # Apply attention to values
+        out = attn @ v  # [batch, num_heads, H*W, head_dim]
+        out = out.transpose(1, 2).reshape(batch_size, H * W, C)  # [batch, H*W, C]
+        
+        # Project and add residual
+        out = self.proj(out)
+        out = self.dropout(out)
+        out = out + residual
+        
+        # Reshape back to [batch, C, H, W]
+        out = out.permute(0, 2, 1).view(batch_size, C, H, W)
+        
+        return out
+
+
+class SpatialCrossAttention(nn.Module):
+    """Cross-attention layer for compressing spatial feature maps.
+    
+    Uses a query derived from proprioceptive state and goal position to compress
+    a 2D feature map F'_t ∈ R^(C × H × W) into a 1D representation F̂_t ∈ R^(C × 1).
+    
+    Args:
+        feature_channels: Number of channels C in the feature map
+        query_dim: Dimension of the query vector (proprioceptive + goal features)
+        num_heads: Number of attention heads (default: 8)
+        dropout: Dropout probability (default: 0.1)
+    """
+    
+    def __init__(self, feature_channels: int, query_dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.feature_channels = feature_channels
+        self.query_dim = query_dim
+        self.num_heads = num_heads
+        self.head_dim = feature_channels // num_heads
+        
+        assert feature_channels % num_heads == 0, \
+            f"feature_channels ({feature_channels}) must be divisible by num_heads ({num_heads})"
+        
+        # Project query to match feature channels
+        self.query_proj = nn.Linear(query_dim, feature_channels)
+        
+        # Linear projections for K, V from features
+        self.kv = nn.Linear(feature_channels, feature_channels * 2, bias=False)
+        
+        # Output projection
+        self.proj = nn.Linear(feature_channels, feature_channels)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, features: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: Feature map F'_t [batch, C, H, W]
+            query: Query vector from proprioceptive state and goal [batch, query_dim]
+        Returns:
+            Compressed feature F̂_t [batch, C, 1]
+        """
+        batch_size, C, H, W = features.shape
+        
+        # Reshape features to [batch, H*W, C]
+        features_flat = features.view(batch_size, C, H * W).permute(0, 2, 1)  # [batch, H*W, C]
+        
+        # Project query: [batch, query_dim] -> [batch, 1, C]
+        q = self.query_proj(query).unsqueeze(1)  # [batch, 1, C]
+        
+        # Reshape query for multi-head attention
+        q = q.reshape(batch_size, 1, self.num_heads, self.head_dim)
+        q = q.permute(0, 2, 1, 3)  # [batch, num_heads, 1, head_dim]
+        
+        # Compute K, V from features
+        kv = self.kv(features_flat)  # [batch, H*W, 2*C]
+        kv = kv.reshape(batch_size, H * W, 2, self.num_heads, self.head_dim)
+        kv = kv.permute(2, 0, 3, 1, 4)  # [2, batch, num_heads, H*W, head_dim]
+        k, v = kv[0], kv[1]
+        
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale  # [batch, num_heads, 1, H*W]
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        # Apply attention to values
+        out = attn @ v  # [batch, num_heads, 1, head_dim]
+        out = out.transpose(1, 2).reshape(batch_size, 1, C)  # [batch, 1, C]
+        
+        # Project
+        out = self.proj(out)
+        out = self.dropout(out)
+        
+        # Reshape to [batch, C, 1] for consistency with feature map format
+        out = out.permute(0, 2, 1)  # [batch, C, 1]
+        
+        return out
+
+
+class AttentionFeatureCompressor(nn.Module):
+    """Complete attention-based feature compression module.
+    
+    Combines self-attention and cross-attention layers to process and compress
+    spatial feature maps according to the paper's architecture.
+    
+    Args:
+        feature_channels: Number of channels C in the input feature map
+        query_dim: Dimension of the query vector (proprioceptive + goal features)
+        num_heads: Number of attention heads (default: 8)
+        dropout: Dropout probability (default: 0.1)
+    """
+    
+    def __init__(self, feature_channels: int, query_dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.self_attention = SpatialSelfAttention(feature_channels, num_heads, dropout)
+        self.cross_attention = SpatialCrossAttention(feature_channels, query_dim, num_heads, dropout)
+        
+    def forward(self, features: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: Input feature map F_t [batch, C, H, W]
+            query: Query vector [batch, query_dim]
+        Returns:
+            Compressed feature F̂_t [batch, C, 1]
+        """
+        # Self-attention: enrich spatial features with global context
+        features_refined = self.self_attention(features)  # [batch, C, H, W]
+        
+        # Cross-attention: compress to 1D using query
+        features_compressed = self.cross_attention(features_refined, query)  # [batch, C, 1]
+        
+        return features_compressed
+
