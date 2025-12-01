@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -43,6 +44,8 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # Deep Mutual Learning parameters
+        dml_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -90,6 +93,22 @@ class PPO:
             self.symmetry = symmetry_cfg
         else:
             self.symmetry = None
+
+        # Deep Mutual Learning components
+        if dml_cfg is not None:
+            self.dml_coef = dml_cfg.get("dml_coef", 0.1)
+            self.dml_loss_type = dml_cfg.get("loss_type", "kl")  # "kl" or "mse" or "both"
+            # Create second policy (student2) by deep copying the first one
+            self.policy2 = copy.deepcopy(policy)
+            self.policy2.to(self.device)
+            # Create optimizer for policy2
+            self.optimizer2 = optim.Adam(self.policy2.parameters(), lr=learning_rate)
+            print(f"Deep Mutual Learning enabled with coefficient {self.dml_coef} and loss type {self.dml_loss_type}")
+        else:
+            self.policy2 = None
+            self.optimizer2 = None
+            self.dml_coef = 0.0
+            self.dml_loss_type = None
 
         # PPO components
         self.policy = policy
@@ -147,6 +166,11 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
+        # For DML: also compute actions from policy2 (but use policy1's actions for rollout)
+        if self.policy2 is not None:
+            if self.policy2.is_recurrent:
+                # Reset policy2 with same hidden states structure (for consistency)
+                self.policy2.reset()
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
@@ -177,6 +201,8 @@ class PPO:
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
+        if self.policy2 is not None:
+            self.policy2.reset(dones)
 
     def compute_returns(self, last_critic_obs):
         # compute value for the last step
@@ -199,6 +225,11 @@ class PPO:
             mean_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
+        # -- DML loss
+        if self.policy2 is not None:
+            mean_dml_loss = 0
+        else:
+            mean_dml_loss = None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -369,10 +400,80 @@ class PPO:
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
+            # Deep Mutual Learning loss (computed once, added to both policies)
+            dml_loss = None
+            if self.policy2 is not None:
+                # Get action distributions from both policies
+                # Policy 1 (already computed above)
+                dist1 = self.policy.distribution
+                value1 = value_batch
+                
+                # Policy 2
+                self.policy2.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+                dist2 = self.policy2.distribution
+                value2 = self.policy2.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+                
+                # Compute mutual learning loss
+                dml_loss = 0.0
+                
+                if self.dml_loss_type in ["kl", "both"]:
+                    # KL divergence: bidirectional (KL(p1||p2) + KL(p2||p1))
+                    kl_12 = torch.distributions.kl.kl_divergence(dist1, dist2).sum(dim=-1)
+                    kl_21 = torch.distributions.kl.kl_divergence(dist2, dist1).sum(dim=-1)
+                    dml_loss += (kl_12.mean() + kl_21.mean()) / 2.0
+                
+                if self.dml_loss_type in ["mse", "both"]:
+                    # MSE between action means and values
+                    mse_loss_fn = torch.nn.MSELoss()
+                    action_mean_loss = mse_loss_fn(self.policy.action_mean, self.policy2.action_mean)
+                    value_loss_dml = mse_loss_fn(value1, value2)
+                    dml_loss += (action_mean_loss + value_loss_dml) / 2.0
+                
+                # Add DML loss to total loss (for policy 1)
+                loss += self.dml_coef * dml_loss
+
             # Compute the gradients
-            # -- For PPO
+            # -- For PPO (policy 1)
             self.optimizer.zero_grad()
             loss.backward()
+            # -- For PPO (policy 2) - DML
+            if self.policy2 is not None:
+                # Compute loss for policy2 (same structure but with policy2's predictions)
+                self.policy2.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+                actions_log_prob_batch2 = self.policy2.get_actions_log_prob(actions_batch)
+                value_batch2 = self.policy2.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+                mu_batch2 = self.policy2.action_mean[:original_batch_size]
+                sigma_batch2 = self.policy2.action_std[:original_batch_size]
+                entropy_batch2 = self.policy2.entropy[:original_batch_size]
+                
+                # Surrogate loss for policy2
+                ratio2 = torch.exp(actions_log_prob_batch2 - torch.squeeze(old_actions_log_prob_batch))
+                surrogate2 = -torch.squeeze(advantages_batch) * ratio2
+                surrogate_clipped2 = -torch.squeeze(advantages_batch) * torch.clamp(
+                    ratio2, 1.0 - self.clip_param, 1.0 + self.clip_param
+                )
+                surrogate_loss2 = torch.max(surrogate2, surrogate_clipped2).mean()
+                
+                # Value loss for policy2
+                if self.use_clipped_value_loss:
+                    value_clipped2 = target_values_batch + (value_batch2 - target_values_batch).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    value_losses2 = (value_batch2 - returns_batch).pow(2)
+                    value_losses_clipped2 = (value_clipped2 - returns_batch).pow(2)
+                    value_loss2 = torch.max(value_losses2, value_losses_clipped2).mean()
+                else:
+                    value_loss2 = (returns_batch - value_batch2).pow(2).mean()
+                
+                loss2 = surrogate_loss2 + self.value_loss_coef * value_loss2 - self.entropy_coef * entropy_batch2.mean()
+                
+                # Add DML loss to policy2 (same loss computed above)
+                if dml_loss is not None:
+                    loss2 += self.dml_coef * dml_loss
+                
+                self.optimizer2.zero_grad()
+                loss2.backward()
+            
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
@@ -383,9 +484,13 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients
-            # -- For PPO
+            # -- For PPO (policy 1)
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            # -- For PPO (policy 2) - DML
+            if self.optimizer2 is not None:
+                nn.utils.clip_grad_norm_(self.policy2.parameters(), self.max_grad_norm)
+                self.optimizer2.step()
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
@@ -400,6 +505,9 @@ class PPO:
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # -- DML loss
+            if mean_dml_loss is not None and dml_loss is not None:
+                mean_dml_loss += dml_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -412,6 +520,9 @@ class PPO:
         # -- For Symmetry
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        # -- For DML
+        if mean_dml_loss is not None:
+            mean_dml_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -425,6 +536,8 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.policy2 is not None:
+            loss_dict["dml"] = mean_dml_loss
 
         return loss_dict
 
@@ -436,14 +549,21 @@ class PPO:
         """Broadcast model parameters to all GPUs."""
         # obtain the model parameters on current GPU
         model_params = [self.policy.state_dict()]
+        if self.policy2 is not None:
+            model_params.append(self.policy2.state_dict())
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
         # broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # load the model parameters on all GPUs from source GPU
-        self.policy.load_state_dict(model_params[0])
+        idx = 0
+        self.policy.load_state_dict(model_params[idx])
+        idx += 1
+        if self.policy2 is not None:
+            self.policy2.load_state_dict(model_params[idx])
+            idx += 1
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            self.rnd.predictor.load_state_dict(model_params[idx])
 
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
@@ -452,6 +572,8 @@ class PPO:
         """
         # Create a tensor to store the gradients
         grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        if self.policy2 is not None:
+            grads += [param.grad.view(-1) for param in self.policy2.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
@@ -462,6 +584,8 @@ class PPO:
 
         # Get all parameters
         all_params = self.policy.parameters()
+        if self.policy2 is not None:
+            all_params = chain(all_params, self.policy2.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
 

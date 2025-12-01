@@ -54,15 +54,20 @@ class SRUCell(nn.Module):
         h_prev, c_prev = hidden
         
         # Spatial transformation: st = Wxs*xt + bs
-        s_t = self.W_xs @ x + self.b_s
+        # x: [batch_size, input_size], W_xs: [hidden_size, input_size]
+        # Result: [batch_size, hidden_size]
+        s_t = x @ self.W_xs.T + self.b_s
         
         # Standard LSTM gates
-        i_t = torch.sigmoid(self.W_xi @ x + self.W_hi @ h_prev + self.b_i)  # Input gate
-        f_t = torch.sigmoid(self.W_xf @ x + self.W_hf @ h_prev + self.b_f)  # Forget gate
-        o_t = torch.sigmoid(x @ self.W_io.T + h_prev @ self.W_ho.T + self.b_o)  # Output gate
+        # x: [batch_size, input_size], W_xi: [hidden_size, input_size]
+        # h_prev: [batch_size, hidden_size], W_hi: [hidden_size, hidden_size]
+        # Result: [batch_size, hidden_size]
+        i_t = torch.sigmoid(x @ self.W_xi.T + h_prev @ self.W_hi.T + self.b_i)  # Input gate
+        f_t = torch.sigmoid(x @ self.W_xf.T + h_prev @ self.W_hf.T + self.b_f)  # Forget gate
+        o_t = torch.sigmoid(x @ self.W_xo.T + h_prev @ self.W_ho.T + self.b_o)  # Output gate
         
         # SRU-modified cell gate: gt = tanh(st ⊙ (Wxg*xt + Whg*ht-1 + bg))
-        g_t = torch.tanh(s_t * (self.W_xg @ x + self.W_hg @ h_prev + self.b_g))
+        g_t = torch.tanh(s_t * (x @ self.W_xg.T + h_prev @ self.W_hg.T + self.b_g))
 
         r_t = i_t * (1 - (1 - f_t)**2) + (1 - i_t) * (f_t**2)
         
@@ -113,7 +118,7 @@ class SRU(nn.Module):
             outputs.append(x_t)
         
         # Return tuple (h, c) like LSTM for proper state management
-        return torch.stack(outputs, dim=0), (torch.stack(h, dim=0), torch.stack(c, dim=0))
+        return torch.stack(outputs, dim=0).squeeze(1), (torch.stack(h, dim=0), torch.stack(c, dim=0))
 
 
 class Memory(torch.nn.Module):

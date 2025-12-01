@@ -63,9 +63,9 @@ class ActorCriticRecurrent(ActorCritic):
 
         activation = resolve_nn_activation(activation)
 
-        self.num_height_scan_points = 651
+        self.num_height_scan_points = 2501
         self.height_scan_size = (6, 4)
-        self.height_scan_resolution = 0.2
+        self.height_scan_resolution = 0.1
         self.height_scan_x = int(round(self.height_scan_size[0] / self.height_scan_resolution)) + 1
         self.height_scan_y = int(round(self.height_scan_size[1] / self.height_scan_resolution)) + 1
 
@@ -167,8 +167,8 @@ class ActorCriticRecurrent(ActorCritic):
         # self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
         # self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
-        # self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        # self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
         print(f"Actor RNN: {self.memory_a}")
         print(f"Critic RNN: {self.memory_c}")
@@ -179,19 +179,19 @@ class ActorCriticRecurrent(ActorCritic):
 
     def act(self, observations, masks=None, hidden_states=None):
         # observations = self.encode_observations(observations)
-        observations = self.encode_observations_with_attention(observations)
+        # observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
         # observations = self.encode_observations(observations)
-        observations = self.encode_observations_with_attention(observations)
+        # observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
         # critic_observations = self.encode_observations(critic_observations)
-        critic_observations = self.encode_observations_with_attention(critic_observations)
+        # critic_observations = self.encode_observations_with_attention(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 
