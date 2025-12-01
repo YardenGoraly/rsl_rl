@@ -6,5 +6,6 @@
 """Definitions for neural networks."""
 
 from .memory import Memory
+from .networks_misc import ResidualBlock, HeightScanEncoder, PositionEncoder
 
-__all__ = ["Memory"]
+__all__ = ["Memory", "ResidualBlock", "HeightScanEncoder", "PositionEncoder"]
