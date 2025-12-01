@@ -103,7 +103,7 @@ class PositionEncoder(nn.Module):
     """1D CNN encoder for past position history.
     
     Processes past positions as a temporal sequence using 1D convolutions.
-    Input: flattened position history [batch, num_positions * 2] where each position is (x, y)
+    Input: flattened position history [batch, num_positions * 3] where each position is (x, y, z)
     Output: encoded features [batch, out_features]
     """
 
@@ -113,9 +113,9 @@ class PositionEncoder(nn.Module):
         self.out_features = out_features
         self.normalize = normalize
         
-        # Process x and y coordinates as separate channels (2 channels: x, y)
+        # Process x, y, and z coordinates as separate channels (3 channels: x, y, z)
         # Architecture: multiple 1D conv layers with increasing channels
-        self.conv1 = nn.Conv1d(2, 16, kernel_size=3, padding=1, padding_mode="replicate", bias=True)
+        self.conv1 = nn.Conv1d(3, 16, kernel_size=3, padding=1, padding_mode="replicate", bias=True)
         self.bn1 = nn.BatchNorm1d(16)
         self.relu1 = nn.ReLU(inplace=True)
         
@@ -136,14 +136,14 @@ class PositionEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Flattened position history [batch, num_positions * 2]
+            x: Flattened position history [batch, num_positions * 3]
         Returns:
             Encoded features [batch, out_features]
         """
-        # Reshape from [batch, num_positions * 2] to [batch, 2, num_positions]
-        # Treating x and y as separate channels for the 1D conv
+        # Reshape from [batch, num_positions * 3] to [batch, 3, num_positions]
+        # Treating x, y, and z as separate channels for the 1D conv
         batch_size = x.shape[0]
-        x = x.view(batch_size, 2, self.num_positions)
+        x = x.view(batch_size, 3, self.num_positions)
         
         # Optional normalization (similar to height scan)
         if self.normalize:
@@ -225,57 +225,57 @@ class ActorCriticRecurrent(ActorCritic):
 
         # Height scan normalization parameters
         # Should match your height_scan_clipped clip_height range (default: (-1.0, 0.5))
-        height_scan_normalize = kwargs.pop("height_scan_normalize", True)
-        height_scan_min = kwargs.pop("height_scan_min", -2.0)
-        height_scan_max = kwargs.pop("height_scan_max", 2.0)
+        # height_scan_normalize = kwargs.pop("height_scan_normalize", True)
+        # height_scan_min = kwargs.pop("height_scan_min", -2.0)
+        # height_scan_max = kwargs.pop("height_scan_max", 2.0)
         
-        self.CNN_encoder = HeightScanEncoder(
-            input_shape=(self.height_scan_x, self.height_scan_y),
-            out_features=34,
-            normalize=height_scan_normalize,
-            height_min=height_scan_min,
-            height_max=height_scan_max,
-        )
-        self.encoder_out_dim = self.CNN_encoder.out_features
+        # self.CNN_encoder = HeightScanEncoder(
+        #     input_shape=(self.height_scan_x, self.height_scan_y),
+        #     out_features=34,
+        #     normalize=height_scan_normalize,
+        #     height_min=height_scan_min,
+        #     height_max=height_scan_max,
+        # )
+        # self.encoder_out_dim = self.CNN_encoder.out_features
 
-        # Past positions encoder parameters
-        # Calculate from config: max_distance=10.0, interval=0.2 -> num_positions = int(10.0/0.2) + 1 = 51
-        num_past_positions = kwargs.pop("num_past_positions", 51)  # Default from max_distance=10.0, interval=0.2
-        past_positions_out_features = kwargs.pop("past_positions_out_features", 16)  # Encoded feature size
-        past_positions_normalize = kwargs.pop("past_positions_normalize", True)
-        self.num_past_positions = num_past_positions
-        self.num_past_position_points = num_past_positions * 2  # Each position is (x, y)
+        # # Past positions encoder parameters
+        # # Calculate from config: max_distance=10.0, interval=0.2 -> num_positions = int(10.0/0.2) + 1 = 51
+        # num_past_positions = kwargs.pop("num_past_positions", 20) 
+        # past_positions_out_features = kwargs.pop("past_positions_out_features", 16)  # Encoded feature size
+        # past_positions_normalize = kwargs.pop("past_positions_normalize", True)
+        # self.num_past_positions = num_past_positions
+        # self.num_past_position_points = num_past_positions * 3  # Each position is (x, y, z)
         
-        self.position_encoder = PositionEncoder(
-            num_positions=num_past_positions,
-            out_features=past_positions_out_features,
-            normalize=past_positions_normalize,
-        )
-        self.position_encoder_out_dim = self.position_encoder.out_features
+        # self.position_encoder = PositionEncoder(
+        #     num_positions=num_past_positions,
+        #     out_features=past_positions_out_features,
+        #     normalize=past_positions_normalize,
+        # )
+        # self.position_encoder_out_dim = self.position_encoder.out_features
 
-        # Calculate encoded observation dimensions
-        # Remove: height_scan (651) + past_positions (num_past_positions * 2)
-        # Add: CNN features (34) + position encoder features (past_positions_out_features)
-        encoded_actor_obs_dim = (
-            num_actor_obs 
-            - self.num_height_scan_points 
-            - self.num_past_position_points
-            + self.encoder_out_dim 
-            + self.position_encoder_out_dim
-        )
-        encoded_critic_obs_dim = (
-            num_critic_obs 
-            - self.num_height_scan_points 
-            - self.num_past_position_points
-            + self.encoder_out_dim 
-            + self.position_encoder_out_dim
-        )
+        # # Calculate encoded observation dimensions
+        # # Remove: height_scan (651) + past_positions (num_past_positions * 2)
+        # # Add: CNN features (34) + position encoder features (past_positions_out_features)
+        # encoded_actor_obs_dim = (
+        #     num_actor_obs 
+        #     - self.num_height_scan_points 
+        #     - self.num_past_position_points
+        #     + self.encoder_out_dim 
+        #     + self.position_encoder_out_dim
+        # )
+        # encoded_critic_obs_dim = (
+        #     num_critic_obs 
+        #     - self.num_height_scan_points 
+        #     - self.num_past_position_points
+        #     + self.encoder_out_dim 
+        #     + self.position_encoder_out_dim
+        # )
 
-        self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
-        # self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        # self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
         print(f"Actor RNN: {self.memory_a}")
         print(f"Critic RNN: {self.memory_c}")
@@ -285,17 +285,17 @@ class ActorCriticRecurrent(ActorCritic):
         self.memory_c.reset(dones)
 
     def act(self, observations, masks=None, hidden_states=None):
-        observations = self.encode_observations(observations)
+        # observations = self.encode_observations(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
-        observations = self.encode_observations(observations)
+        # observations = self.encode_observations(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
-        critic_observations = self.encode_observations(critic_observations)
+        # critic_observations = self.encode_observations(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 
