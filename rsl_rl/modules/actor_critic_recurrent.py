@@ -69,10 +69,14 @@ class ActorCriticRecurrent(ActorCritic):
         self.height_scan_x = int(round(self.height_scan_size[0] / self.height_scan_resolution)) + 1
         self.height_scan_y = int(round(self.height_scan_size[1] / self.height_scan_resolution)) + 1
 
+        # Observation encoding parameters
+        self.use_position_encoding = kwargs.pop("use_position_encoding", False)
+        self.use_height_scan_encoding = kwargs.pop("use_height_scan_encoding", False)
+        self.height_scan_encoding_out_features = kwargs.pop("height_scan_encoding_out_features", 64)
+
         # Attention-based encoding parameters
         self.use_attention_encoding = kwargs.pop("use_attention_encoding", False)
-        self.use_position_encoding = kwargs.pop("use_position_encoding", False)
-        self.use_height_scan_encoding = kwargs.pop("use_height_scan_encoding", True)
+        
         if self.use_attention_encoding:
             # Observation indices (configurable via kwargs)
             self.height_scan_start_idx = kwargs.pop("height_scan_start_idx", 34)
@@ -85,8 +89,8 @@ class ActorCriticRecurrent(ActorCritic):
             self.num_past_position_points = self.num_past_positions * 3  # Each position is (x, y, z)
             
             # Attention parameters
-            self.attention_feature_channels = kwargs.pop("attention_feature_channels", 32)
-            self.attention_num_heads = kwargs.pop("attention_num_heads", 1)
+            self.attention_feature_channels = kwargs.pop("attention_feature_channels", 64)
+            self.attention_num_heads = kwargs.pop("attention_num_heads", 4)
             self.attention_dropout = kwargs.pop("attention_dropout", 0.1)
             
             # Compute goal and past positions indices if not provided
@@ -126,7 +130,7 @@ class ActorCriticRecurrent(ActorCritic):
         
         self.CNN_encoder = HeightScanEncoder(
             input_shape=(self.height_scan_x, self.height_scan_y),
-            out_features=64,
+            out_features=self.height_scan_encoding_out_features,
             normalize=height_scan_normalize,
             height_min=height_scan_min,
             height_max=height_scan_max,
@@ -197,6 +201,7 @@ class ActorCriticRecurrent(ActorCritic):
                 - self.num_height_scan_points 
                 + self.attention_output_dim
             )
+            
 
         self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
         self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
@@ -317,11 +322,20 @@ class ActorCriticRecurrent(ActorCritic):
         else:
             time_steps = None
             batch_size_actual = observations.shape[0]
+
+        if self.use_height_scan_encoding:
+            num_height_scan_points = self.height_scan_encoding_out_features
+            height_scan_x = int(num_height_scan_points ** 0.5)
+            height_scan_y = int(num_height_scan_points ** 0.5)
+        else:
+            num_height_scan_points = self.num_height_scan_points
+            height_scan_x = self.height_scan_x
+            height_scan_y = self.height_scan_y
         
         # Extract height-scan and reshape to 2D feature map [batch, 1, H, W]
-        height_scan_end_idx = self.height_scan_start_idx + self.num_height_scan_points
+        height_scan_end_idx = self.height_scan_start_idx + num_height_scan_points
         height_scan_flat = observations[:, self.height_scan_start_idx : height_scan_end_idx].clone()
-        height_scan_2d = height_scan_flat.reshape(batch_size_actual, 1, self.height_scan_x, self.height_scan_y)
+        height_scan_2d = height_scan_flat.reshape(batch_size_actual, 1, height_scan_x, height_scan_y)
         
         # Convert to feature channels [batch, C, H, W]
         height_features = self.height_scan_to_features(height_scan_2d)  # [batch_size_actual, C, H, W]
@@ -331,9 +345,14 @@ class ActorCriticRecurrent(ActorCritic):
         
         goal_end_idx = self.goal_start_idx + self.goal_dim
         goal = observations[:, self.goal_start_idx : goal_end_idx].clone()
+
+        if self.use_height_scan_encoding:
+            past_positions_start_idx = self.proprioception_start_idx + self.proprioception_dim + self.goal_dim + self.height_scan_encoding_out_features
+        else:
+            past_positions_start_idx = self.past_positions_start_idx
         
-        past_positions_end_idx = self.past_positions_start_idx + self.num_past_position_points
-        past_positions = observations[:, self.past_positions_start_idx : past_positions_end_idx].clone()
+        past_positions_end_idx = past_positions_start_idx + self.num_past_position_points
+        past_positions = observations[:, past_positions_start_idx : past_positions_end_idx].clone()
         
         # Concatenate to form query [batch, query_dim]
         query = torch.cat([proprioception, goal, past_positions], dim=1)

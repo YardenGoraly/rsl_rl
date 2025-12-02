@@ -7,8 +7,8 @@ def benchmark_actor_critic_recurrent(device="cuda" if torch.cuda.is_available() 
     print(f"Running benchmark on {device.upper()}")    
     # Create an instance of the model
     model = ActorCriticRecurrent(
-        num_actor_obs=2557,     # Example observation size
-        num_critic_obs=2557,
+        num_actor_obs=2595,     # Example observation size
+        num_critic_obs=2595,
         num_actions=12,
         rnn_hidden_dim=256,
         rnn_num_layers=1,
@@ -20,7 +20,7 @@ def benchmark_actor_critic_recurrent(device="cuda" if torch.cuda.is_available() 
     batch_sizes = [1, 1000]
     warmup_passes = 10
     timed_passes = 50
-    obs_dim = 2557  # must match num_actor_obs    
+    obs_dim = 2595  # must match num_actor_obs    
     for batch_size in batch_sizes:
         model.reset()
         print(f"\n--- Benchmarking with batch size = {batch_size} ---")        
