@@ -98,17 +98,35 @@ class PPO:
         if dml_cfg is not None:
             self.dml_coef = dml_cfg.get("dml_coef", 0.1)
             self.dml_loss_type = dml_cfg.get("loss_type", "kl")  # "kl" or "mse" or "both"
+            # Determine policy2's device (default to GPU 1 if available, otherwise same as policy1)
+            policy2_device = dml_cfg.get("policy2_device", None)
+            if policy2_device is None:
+                # Auto-detect: if policy1 is on cuda:0, try to use cuda:1
+                if isinstance(self.device, str) and self.device.startswith("cuda:"):
+                    try:
+                        device_id = int(self.device.split(":")[1])
+                        if device_id == 0 and torch.cuda.device_count() > 1:
+                            policy2_device = "cuda:1"
+                        else:
+                            policy2_device = self.device  # Use same device if only one GPU or policy1 not on GPU 0
+                    except (ValueError, IndexError):
+                        policy2_device = self.device
+                else:
+                    policy2_device = self.device
+            self.device2 = policy2_device
             # Create second policy (student2) by deep copying the first one
             self.policy2 = copy.deepcopy(policy)
-            self.policy2.to(self.device)
+            self.policy2.to(self.device2)
             # Create optimizer for policy2
             self.optimizer2 = optim.Adam(self.policy2.parameters(), lr=learning_rate)
             print(f"Deep Mutual Learning enabled with coefficient {self.dml_coef} and loss type {self.dml_loss_type}")
+            print(f"Policy1 on device: {self.device}, Policy2 on device: {self.device2}")
         else:
             self.policy2 = None
             self.optimizer2 = None
             self.dml_coef = 0.0
             self.dml_loss_type = None
+            self.device2 = None
 
         # PPO components
         self.policy = policy
@@ -172,8 +190,15 @@ class PPO:
             if self.policy2.is_recurrent:
                 # Get policy2's hidden states to maintain synchronization
                 # We process obs through policy2 to update its hidden states (but don't use the actions)
-                _ = self.policy2.act(obs).detach()
-                _ = self.policy2.evaluate(critic_obs).detach()
+                # Move observations to policy2's device if different
+                if self.device != self.device2:
+                    obs2 = obs.to(self.device2)
+                    critic_obs2 = critic_obs.to(self.device2)
+                else:
+                    obs2 = obs
+                    critic_obs2 = critic_obs
+                _ = self.policy2.act(obs2).detach()
+                _ = self.policy2.evaluate(critic_obs2).detach()
             else:
                 # For non-recurrent policies, no hidden states to maintain
                 pass
@@ -306,10 +331,36 @@ class PPO:
 
             # For DML: compute policy2's forward pass once (reused for both DML loss and policy2's PPO loss)
             if self.policy2 is not None:
-                # Policy 2 forward pass
-                self.policy2.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-                actions_log_prob_batch2 = self.policy2.get_actions_log_prob(actions_batch)
-                value_batch2 = self.policy2.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+                # Move inputs to policy2's device if different from policy1's device
+                if self.device != self.device2:
+                    obs_batch2 = obs_batch.to(self.device2)
+                    critic_obs_batch2 = critic_obs_batch.to(self.device2)
+                    actions_batch2 = actions_batch.to(self.device2)
+                    masks_batch2 = masks_batch.to(self.device2) if masks_batch is not None else None
+                    # Handle hidden states (can be tensor, list, or tuple of tensors)
+                    def move_hidden_states_to_device(hid_states, device):
+                        if hid_states is None:
+                            return None
+                        if isinstance(hid_states, torch.Tensor):
+                            return hid_states.to(device)
+                        elif isinstance(hid_states, (list, tuple)):
+                            return type(hid_states)([h.to(device) if isinstance(h, torch.Tensor) else h for h in hid_states])
+                        else:
+                            return hid_states
+                    hid_states_batch2_0 = move_hidden_states_to_device(hid_states_batch[0], self.device2)
+                    hid_states_batch2_1 = move_hidden_states_to_device(hid_states_batch[1], self.device2)
+                    hid_states_batch2 = (hid_states_batch2_0, hid_states_batch2_1)
+                else:
+                    obs_batch2 = obs_batch
+                    critic_obs_batch2 = critic_obs_batch
+                    actions_batch2 = actions_batch
+                    masks_batch2 = masks_batch
+                    hid_states_batch2 = hid_states_batch
+                
+                # Policy 2 forward pass on its device
+                self.policy2.act(obs_batch2, masks=masks_batch2, hidden_states=hid_states_batch2[0])
+                actions_log_prob_batch2 = self.policy2.get_actions_log_prob(actions_batch2)
+                value_batch2 = self.policy2.evaluate(critic_obs_batch2, masks=masks_batch2, hidden_states=hid_states_batch2[1])
                 mu_batch2 = self.policy2.action_mean[:original_batch_size]
                 sigma_batch2 = self.policy2.action_std[:original_batch_size]
                 entropy_batch2 = self.policy2.entropy[:original_batch_size]
@@ -424,8 +475,9 @@ class PPO:
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
-            # Deep Mutual Learning loss (computed once, added to both policies)
-            dml_loss = None
+            # Deep Mutual Learning loss (computed separately for each policy to avoid graph conflicts)
+            dml_loss1 = None
+            dml_loss2 = None
             if self.policy2 is not None:
                 # Get action distributions from both policies (both computed above)
                 dist1 = self.policy.distribution
@@ -433,22 +485,35 @@ class PPO:
                 value1 = value_batch[:original_batch_size] if value_batch.shape[0] > original_batch_size else value_batch
                 value2 = value_batch2[:original_batch_size] if value_batch2.shape[0] > original_batch_size else value_batch2
                 
-                # Compute mutual learning loss
-                dml_loss = 0.0
+                # Compute mutual learning loss for policy1 (with dist2 detached)
+                dml_loss1 = 0.0
+                # Compute mutual learning loss for policy2 (with dist1 detached)
+                dml_loss2 = 0.0
                 
                 if self.dml_loss_type in ["kl", "both"]:
-                    # KL divergence: bidirectional (KL(p1||p2) + KL(p2||p1))
-                    # Detach dist2 to prevent double-counting gradients (standard DML practice)
-                    dist2_detached = torch.distributions.Normal(
-                        dist2.mean.detach(), dist2.stddev.detach()
-                    )
+                    # For policy1: KL(p1||p2_detached) - gradients flow to p1 only
+                    # Move dist2 to policy1's device if needed
+                    if self.device != self.device2:
+                        dist2_mean = dist2.mean.detach().to(self.device)
+                        dist2_stddev = dist2.stddev.detach().to(self.device)
+                    else:
+                        dist2_mean = dist2.mean.detach()
+                        dist2_stddev = dist2.stddev.detach()
+                    dist2_detached = torch.distributions.Normal(dist2_mean, dist2_stddev)
                     kl_12 = torch.distributions.kl.kl_divergence(dist1, dist2_detached).sum(dim=-1)
-                    # For KL(p2||p1), detach dist1
-                    dist1_detached = torch.distributions.Normal(
-                        dist1.mean.detach(), dist1.stddev.detach()
-                    )
+                    dml_loss1 += kl_12.mean()
+                    
+                    # For policy2: KL(p2||p1_detached) - gradients flow to p2 only
+                    # Move dist1 to policy2's device if needed
+                    if self.device != self.device2:
+                        dist1_mean = dist1.mean.detach().to(self.device2)
+                        dist1_stddev = dist1.stddev.detach().to(self.device2)
+                    else:
+                        dist1_mean = dist1.mean.detach()
+                        dist1_stddev = dist1.stddev.detach()
+                    dist1_detached = torch.distributions.Normal(dist1_mean, dist1_stddev)
                     kl_21 = torch.distributions.kl.kl_divergence(dist2, dist1_detached).sum(dim=-1)
-                    dml_loss += (kl_12.mean() + kl_21.mean()) / 2.0
+                    dml_loss2 += kl_21.mean()
                 
                 if self.dml_loss_type in ["mse", "both"]:
                     # MSE between action means and values
@@ -456,17 +521,40 @@ class PPO:
                     action_mean1 = self.policy.action_mean[:original_batch_size]
                     action_mean2 = self.policy2.action_mean[:original_batch_size]
                     mse_loss_fn = torch.nn.MSELoss()
-                    action_mean_loss = mse_loss_fn(action_mean1, action_mean2)
+                    
                     # Ensure value shapes match
                     if value1.shape != value2.shape:
                         min_size = min(value1.shape[0], value2.shape[0])
-                        value1 = value1[:min_size]
-                        value2 = value2[:min_size]
-                    value_loss_dml = mse_loss_fn(value1, value2)
-                    dml_loss += (action_mean_loss + value_loss_dml) / 2.0
+                        value1_sliced = value1[:min_size]
+                        value2_sliced = value2[:min_size]
+                    else:
+                        value1_sliced = value1
+                        value2_sliced = value2
+                    
+                    # For policy1: MSE with policy2's mean detached (on policy1's device)
+                    if self.device != self.device2:
+                        action_mean2_detached = action_mean2.detach().to(self.device)
+                        value2_detached = value2_sliced.detach().to(self.device)
+                    else:
+                        action_mean2_detached = action_mean2.detach()
+                        value2_detached = value2_sliced.detach()
+                    action_mean_loss1 = mse_loss_fn(action_mean1, action_mean2_detached)
+                    value_loss_dml1 = mse_loss_fn(value1_sliced, value2_detached)
+                    dml_loss1 += (action_mean_loss1 + value_loss_dml1) / 2.0
+                    
+                    # For policy2: MSE with policy1's mean detached (on policy2's device)
+                    if self.device != self.device2:
+                        action_mean1_detached = action_mean1.detach().to(self.device2)
+                        value1_detached = value1_sliced.detach().to(self.device2)
+                    else:
+                        action_mean1_detached = action_mean1.detach()
+                        value1_detached = value1_sliced.detach()
+                    action_mean_loss2 = mse_loss_fn(action_mean2, action_mean1_detached)
+                    value_loss_dml2 = mse_loss_fn(value2_sliced, value1_detached)
+                    dml_loss2 += (action_mean_loss2 + value_loss_dml2) / 2.0
                 
                 # Add DML loss to total loss (for policy 1)
-                loss += self.dml_coef * dml_loss
+                loss += self.dml_coef * dml_loss1
 
             # Compute the gradients
             # -- For PPO (policy 1)
@@ -474,31 +562,43 @@ class PPO:
             loss.backward()
             # -- For PPO (policy 2) - DML
             if self.policy2 is not None:
+                # Move necessary tensors to policy2's device if different
+                if self.device != self.device2:
+                    old_actions_log_prob_batch2 = old_actions_log_prob_batch.to(self.device2)
+                    advantages_batch2 = advantages_batch.to(self.device2)
+                    target_values_batch2 = target_values_batch.to(self.device2)
+                    returns_batch2 = returns_batch.to(self.device2)
+                else:
+                    old_actions_log_prob_batch2 = old_actions_log_prob_batch
+                    advantages_batch2 = advantages_batch
+                    target_values_batch2 = target_values_batch
+                    returns_batch2 = returns_batch
+                
                 # Use policy2's forward pass results computed earlier (no redundant computation)
                 # Surrogate loss for policy2
-                ratio2 = torch.exp(actions_log_prob_batch2 - torch.squeeze(old_actions_log_prob_batch))
-                surrogate2 = -torch.squeeze(advantages_batch) * ratio2
-                surrogate_clipped2 = -torch.squeeze(advantages_batch) * torch.clamp(
+                ratio2 = torch.exp(actions_log_prob_batch2 - torch.squeeze(old_actions_log_prob_batch2))
+                surrogate2 = -torch.squeeze(advantages_batch2) * ratio2
+                surrogate_clipped2 = -torch.squeeze(advantages_batch2) * torch.clamp(
                     ratio2, 1.0 - self.clip_param, 1.0 + self.clip_param
                 )
                 surrogate_loss2 = torch.max(surrogate2, surrogate_clipped2).mean()
                 
                 # Value loss for policy2
                 if self.use_clipped_value_loss:
-                    value_clipped2 = target_values_batch + (value_batch2 - target_values_batch).clamp(
+                    value_clipped2 = target_values_batch2 + (value_batch2 - target_values_batch2).clamp(
                         -self.clip_param, self.clip_param
                     )
-                    value_losses2 = (value_batch2 - returns_batch).pow(2)
-                    value_losses_clipped2 = (value_clipped2 - returns_batch).pow(2)
+                    value_losses2 = (value_batch2 - returns_batch2).pow(2)
+                    value_losses_clipped2 = (value_clipped2 - returns_batch2).pow(2)
                     value_loss2 = torch.max(value_losses2, value_losses_clipped2).mean()
                 else:
-                    value_loss2 = (returns_batch - value_batch2).pow(2).mean()
+                    value_loss2 = (returns_batch2 - value_batch2).pow(2).mean()
                 
                 loss2 = surrogate_loss2 + self.value_loss_coef * value_loss2 - self.entropy_coef * entropy_batch2.mean()
                 
-                # Add DML loss to policy2 (same loss computed above)
-                if dml_loss is not None:
-                    loss2 += self.dml_coef * dml_loss
+                # Add DML loss to policy2 (separate loss computed above for policy2)
+                if dml_loss2 is not None:
+                    loss2 += self.dml_coef * dml_loss2
                 
                 self.optimizer2.zero_grad()
                 loss2.backward()
@@ -534,9 +634,9 @@ class PPO:
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            # -- DML loss
-            if mean_dml_loss is not None and dml_loss is not None:
-                mean_dml_loss += dml_loss.item()
+            # -- DML loss (average of both policies for logging)
+            if mean_dml_loss is not None and dml_loss1 is not None and dml_loss2 is not None:
+                mean_dml_loss += (dml_loss1.item() + dml_loss2.item()) / 2.0
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
