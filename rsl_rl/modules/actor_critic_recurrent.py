@@ -197,19 +197,22 @@ class ActorCriticRecurrent(ActorCritic):
 
     def act(self, observations, masks=None, hidden_states=None):
         # observations = self.encode_observations(observations)
-        observations = self.encode_observations_with_attention(observations)
+        if self.use_attention_encoding:
+            observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
         # observations = self.encode_observations(observations)
-        observations = self.encode_observations_with_attention(observations)
+        if self.use_attention_encoding:
+            observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
         # critic_observations = self.encode_observations(critic_observations)
-        critic_observations = self.encode_observations_with_attention(critic_observations)
+        if self.use_attention_encoding:
+            critic_observations = self.encode_observations_with_attention(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 
