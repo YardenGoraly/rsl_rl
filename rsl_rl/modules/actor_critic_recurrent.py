@@ -63,14 +63,16 @@ class ActorCriticRecurrent(ActorCritic):
 
         activation = resolve_nn_activation(activation)
 
-        self.num_height_scan_points = 176
+        self.num_height_scan_points = 2501
         self.height_scan_size = (6, 4)
-        self.height_scan_resolution = 0.4
+        self.height_scan_resolution = 0.1
         self.height_scan_x = int(round(self.height_scan_size[0] / self.height_scan_resolution)) + 1
         self.height_scan_y = int(round(self.height_scan_size[1] / self.height_scan_resolution)) + 1
 
         # Attention-based encoding parameters
-        self.use_attention_encoding = kwargs.pop("use_attention_encoding", True)
+        self.use_attention_encoding = kwargs.pop("use_attention_encoding", False)
+        self.use_position_encoding = kwargs.pop("use_position_encoding", False)
+        self.use_height_scan_encoding = kwargs.pop("use_height_scan_encoding", True)
         if self.use_attention_encoding:
             # Observation indices (configurable via kwargs)
             self.height_scan_start_idx = kwargs.pop("height_scan_start_idx", 34)
@@ -118,51 +120,66 @@ class ActorCriticRecurrent(ActorCritic):
 
         # Height scan normalization parameters
         # Should match your height_scan_clipped clip_height range (default: (-1.0, 0.5))
-        # height_scan_normalize = kwargs.pop("height_scan_normalize", True)
-        # height_scan_min = kwargs.pop("height_scan_min", -2.0)
-        # height_scan_max = kwargs.pop("height_scan_max", 2.0)
+        height_scan_normalize = kwargs.pop("height_scan_normalize", True)
+        height_scan_min = kwargs.pop("height_scan_min", -2.0)
+        height_scan_max = kwargs.pop("height_scan_max", 2.0)
         
-        # self.CNN_encoder = HeightScanEncoder(
-        #     input_shape=(self.height_scan_x, self.height_scan_y),
-        #     out_features=34,
-        #     normalize=height_scan_normalize,
-        #     height_min=height_scan_min,
-        #     height_max=height_scan_max,
-        # )
-        # self.encoder_out_dim = self.CNN_encoder.out_features
+        self.CNN_encoder = HeightScanEncoder(
+            input_shape=(self.height_scan_x, self.height_scan_y),
+            out_features=64,
+            normalize=height_scan_normalize,
+            height_min=height_scan_min,
+            height_max=height_scan_max,
+        )
+        self.encoder_out_dim = self.CNN_encoder.out_features
 
-        # # Past positions encoder parameters
-        # # Calculate from config: max_distance=10.0, interval=0.2 -> num_positions = int(10.0/0.2) + 1 = 51
-        # num_past_positions = kwargs.pop("num_past_positions", 20) 
-        # past_positions_out_features = kwargs.pop("past_positions_out_features", 16)  # Encoded feature size
-        # past_positions_normalize = kwargs.pop("past_positions_normalize", True)
-        # self.num_past_positions = num_past_positions
-        # self.num_past_position_points = num_past_positions * 3  # Each position is (x, y, z)
+        # Past positions encoder parameters
+        # Calculate from config: max_distance=10.0, interval=0.2 -> num_positions = int(10.0/0.2) + 1 = 51
+        num_past_positions = kwargs.pop("num_past_positions", 20) 
+        past_positions_out_features = kwargs.pop("past_positions_out_features", 16)  # Encoded feature size
+        past_positions_normalize = kwargs.pop("past_positions_normalize", True)
+        self.num_past_positions = num_past_positions
+        self.num_past_position_points = num_past_positions * 3  # Each position is (x, y, z)
         
-        # self.position_encoder = PositionEncoder(
-        #     num_positions=num_past_positions,
-        #     out_features=past_positions_out_features,
-        #     normalize=past_positions_normalize,
-        # )
-        # self.position_encoder_out_dim = self.position_encoder.out_features
+        self.position_encoder = PositionEncoder(
+            num_positions=num_past_positions,
+            out_features=past_positions_out_features,
+            normalize=past_positions_normalize,
+        )
+        self.position_encoder_out_dim = self.position_encoder.out_features
 
-        # # Calculate encoded observation dimensions
-        # # Remove: height_scan (651) + past_positions (num_past_positions * 2)
-        # # Add: CNN features (34) + position encoder features (past_positions_out_features)
-        # encoded_actor_obs_dim = (
-        #     num_actor_obs 
-        #     - self.num_height_scan_points 
-        #     - self.num_past_position_points
-        #     + self.encoder_out_dim 
-        #     + self.position_encoder_out_dim
-        # )
-        # encoded_critic_obs_dim = (
-        #     num_critic_obs 
-        #     - self.num_height_scan_points 
-        #     - self.num_past_position_points
-        #     + self.encoder_out_dim 
-        #     + self.position_encoder_out_dim
-        # )
+        # Calculate encoded observation dimensions
+        # Remove: height_scan (651) + past_positions (num_past_positions * 2)
+        # Add: CNN features (34) + position encoder features (past_positions_out_features)
+        if self.use_height_scan_encoding:
+            encoded_actor_obs_dim = (
+                num_actor_obs 
+                - self.num_height_scan_points 
+                + self.encoder_out_dim
+            )
+            encoded_critic_obs_dim = (
+                num_critic_obs 
+                - self.num_height_scan_points 
+                + self.encoder_out_dim
+            )
+        else:
+            encoded_actor_obs_dim = num_actor_obs
+            encoded_critic_obs_dim = num_critic_obs
+        if self.use_position_encoding and self.use_height_scan_encoding:
+            encoded_actor_obs_dim = (
+                num_actor_obs 
+                - self.num_height_scan_points 
+                - self.num_past_position_points
+                + self.encoder_out_dim 
+                + self.position_encoder_out_dim
+            )
+            encoded_critic_obs_dim = (
+                num_critic_obs 
+                - self.num_height_scan_points 
+                - self.num_past_position_points
+                + self.encoder_out_dim 
+                + self.position_encoder_out_dim
+            )
 
         # Calculate encoded observation dimensions
         if self.use_attention_encoding:
@@ -180,10 +197,6 @@ class ActorCriticRecurrent(ActorCritic):
                 - self.num_height_scan_points 
                 + self.attention_output_dim
             )
-        else:
-            # Without attention encoding, use original dimensions
-            encoded_actor_obs_dim = num_actor_obs
-            encoded_critic_obs_dim = num_critic_obs
 
         self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
         self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
@@ -196,21 +209,24 @@ class ActorCriticRecurrent(ActorCritic):
         self.memory_c.reset(dones)
 
     def act(self, observations, masks=None, hidden_states=None):
-        # observations = self.encode_observations(observations)
+        if self.use_height_scan_encoding:
+            observations = self.encode_observations(observations)
         if self.use_attention_encoding:
             observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
-        # observations = self.encode_observations(observations)
+        if self.use_height_scan_encoding:
+            observations = self.encode_observations(observations)
         if self.use_attention_encoding:
             observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
-        # critic_observations = self.encode_observations(critic_observations)
+        if self.use_height_scan_encoding:
+            critic_observations = self.encode_observations(critic_observations)
         if self.use_attention_encoding:
             critic_observations = self.encode_observations_with_attention(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
@@ -245,13 +261,18 @@ class ActorCriticRecurrent(ActorCritic):
         # Pass through height-scan CNN encoder
         encoded_height_scan = self.CNN_encoder(CNN_input)
 
-        # Extract past positions portion (comes after height-scan)
-        past_positions_start_idx = height_scan_end_idx
-        past_positions_end_idx = past_positions_start_idx + self.num_past_position_points
-        past_positions_input = observations[:, past_positions_start_idx : past_positions_end_idx].clone()
+        if self.use_position_encoding:
+            # Extract past positions portion (comes after height-scan)
+            past_positions_start_idx = height_scan_end_idx
+            past_positions_end_idx = past_positions_start_idx + self.num_past_position_points
+            past_positions_input = observations[:, past_positions_start_idx : past_positions_end_idx].clone()
 
-        # Pass through position encoder (1D CNN)
-        encoded_past_positions = self.position_encoder(past_positions_input)
+            # Pass through position encoder (1D CNN)
+            encoded_past_positions = self.position_encoder(past_positions_input)
+        else:
+            past_positions_start_idx = height_scan_end_idx
+            past_positions_end_idx = past_positions_start_idx + self.num_past_position_points
+            encoded_past_positions = observations[:, past_positions_start_idx : past_positions_end_idx].clone()
 
         # Concatenate: [before_height_scan, encoded_height_scan, encoded_past_positions, after_past_positions]
         observations = torch.cat(
