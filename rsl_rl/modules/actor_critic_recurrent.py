@@ -63,28 +63,28 @@ class ActorCriticRecurrent(ActorCritic):
 
         activation = resolve_nn_activation(activation)
 
-        self.num_height_scan_points = 2501
+        self.num_height_scan_points = 176
         self.height_scan_size = (6, 4)
-        self.height_scan_resolution = 0.1
+        self.height_scan_resolution = 0.4
         self.height_scan_x = int(round(self.height_scan_size[0] / self.height_scan_resolution)) + 1
         self.height_scan_y = int(round(self.height_scan_size[1] / self.height_scan_resolution)) + 1
 
         # Attention-based encoding parameters
-        self.use_attention_encoding = kwargs.pop("use_attention_encoding", False)
+        self.use_attention_encoding = kwargs.pop("use_attention_encoding", True)
         if self.use_attention_encoding:
             # Observation indices (configurable via kwargs)
             self.height_scan_start_idx = kwargs.pop("height_scan_start_idx", 34)
             self.proprioception_start_idx = kwargs.pop("proprioception_start_idx", 0)
             self.proprioception_dim = kwargs.pop("proprioception_dim", 30)  # base_lin_vel(3) + base_ang_vel(3) + joint_pos(12) + joint_vel(12)
-            self.goal_dim = kwargs.pop("goal_dim", 2)  # goal_commands (x, y)
+            self.goal_dim = kwargs.pop("goal_dim", 4)  # goal_commands (x, y, z, yaw)
             self.goal_start_idx = kwargs.pop("goal_start_idx", None)  # Will be computed if None
             self.past_positions_start_idx = kwargs.pop("past_positions_start_idx", None)  # Will be computed if None
             self.num_past_positions = kwargs.pop("num_past_positions", 20)
             self.num_past_position_points = self.num_past_positions * 3  # Each position is (x, y, z)
             
             # Attention parameters
-            self.attention_feature_channels = kwargs.pop("attention_feature_channels", 64)
-            self.attention_num_heads = kwargs.pop("attention_num_heads", 8)
+            self.attention_feature_channels = kwargs.pop("attention_feature_channels", 32)
+            self.attention_num_heads = kwargs.pop("attention_num_heads", 1)
             self.attention_dropout = kwargs.pop("attention_dropout", 0.1)
             
             # Compute goal and past positions indices if not provided
@@ -164,11 +164,29 @@ class ActorCriticRecurrent(ActorCritic):
         #     + self.position_encoder_out_dim
         # )
 
-        # self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        # self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        # Calculate encoded observation dimensions
+        if self.use_attention_encoding:
+            # With attention encoding:
+            # - Remove: height_scan (num_height_scan_points)
+            # - Add: compressed attention features (attention_output_dim = attention_feature_channels)
+            # - Keep: past_positions (they're used in query but also kept in output)
+            encoded_actor_obs_dim = (
+                num_actor_obs 
+                - self.num_height_scan_points 
+                + self.attention_output_dim
+            )
+            encoded_critic_obs_dim = (
+                num_critic_obs 
+                - self.num_height_scan_points 
+                + self.attention_output_dim
+            )
+        else:
+            # Without attention encoding, use original dimensions
+            encoded_actor_obs_dim = num_actor_obs
+            encoded_critic_obs_dim = num_critic_obs
 
-        self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
-        self.memory_c = Memory(num_critic_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_a = Memory(encoded_actor_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        self.memory_c = Memory(encoded_critic_obs_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
 
         print(f"Actor RNN: {self.memory_a}")
         print(f"Critic RNN: {self.memory_c}")
@@ -179,19 +197,19 @@ class ActorCriticRecurrent(ActorCritic):
 
     def act(self, observations, masks=None, hidden_states=None):
         # observations = self.encode_observations(observations)
-        # observations = self.encode_observations_with_attention(observations)
+        observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations):
         # observations = self.encode_observations(observations)
-        # observations = self.encode_observations_with_attention(observations)
+        observations = self.encode_observations_with_attention(observations)
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):
         # critic_observations = self.encode_observations(critic_observations)
-        # critic_observations = self.encode_observations_with_attention(critic_observations)
+        critic_observations = self.encode_observations_with_attention(critic_observations)
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 
@@ -304,6 +322,7 @@ class ActorCriticRecurrent(ActorCritic):
         
         # Replace height scan with compressed features
         # Structure: [before_height_scan, compressed_features, past_positions, after_past_positions]
+        #TODO: do the prop observations need to be concated back here?
         observations_encoded = torch.cat(
             [
                 observations[:, :self.height_scan_start_idx].clone(),  # Before height scan

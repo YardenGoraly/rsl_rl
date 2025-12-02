@@ -166,11 +166,17 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
-        # For DML: also compute actions from policy2 (but use policy1's actions for rollout)
+        # For DML: maintain policy2's hidden states during rollouts for consistency
+        # Policy2 processes the same observations to keep hidden states synchronized
         if self.policy2 is not None:
             if self.policy2.is_recurrent:
-                # Reset policy2 with same hidden states structure (for consistency)
-                self.policy2.reset()
+                # Get policy2's hidden states to maintain synchronization
+                # We process obs through policy2 to update its hidden states (but don't use the actions)
+                _ = self.policy2.act(obs).detach()
+                _ = self.policy2.evaluate(critic_obs).detach()
+            else:
+                # For non-recurrent policies, no hidden states to maintain
+                pass
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
@@ -298,6 +304,24 @@ class PPO:
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
+            # For DML: compute policy2's forward pass once (reused for both DML loss and policy2's PPO loss)
+            if self.policy2 is not None:
+                # Policy 2 forward pass
+                self.policy2.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+                actions_log_prob_batch2 = self.policy2.get_actions_log_prob(actions_batch)
+                value_batch2 = self.policy2.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+                mu_batch2 = self.policy2.action_mean[:original_batch_size]
+                sigma_batch2 = self.policy2.action_std[:original_batch_size]
+                entropy_batch2 = self.policy2.entropy[:original_batch_size]
+                dist2 = self.policy2.distribution
+            else:
+                actions_log_prob_batch2 = None
+                value_batch2 = None
+                mu_batch2 = None
+                sigma_batch2 = None
+                entropy_batch2 = None
+                dist2 = None
+
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
@@ -403,29 +427,41 @@ class PPO:
             # Deep Mutual Learning loss (computed once, added to both policies)
             dml_loss = None
             if self.policy2 is not None:
-                # Get action distributions from both policies
-                # Policy 1 (already computed above)
+                # Get action distributions from both policies (both computed above)
                 dist1 = self.policy.distribution
-                value1 = value_batch
-                
-                # Policy 2
-                self.policy2.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-                dist2 = self.policy2.distribution
-                value2 = self.policy2.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+                # Use original batch size for value comparison to handle augmentation correctly
+                value1 = value_batch[:original_batch_size] if value_batch.shape[0] > original_batch_size else value_batch
+                value2 = value_batch2[:original_batch_size] if value_batch2.shape[0] > original_batch_size else value_batch2
                 
                 # Compute mutual learning loss
                 dml_loss = 0.0
                 
                 if self.dml_loss_type in ["kl", "both"]:
                     # KL divergence: bidirectional (KL(p1||p2) + KL(p2||p1))
-                    kl_12 = torch.distributions.kl.kl_divergence(dist1, dist2).sum(dim=-1)
-                    kl_21 = torch.distributions.kl.kl_divergence(dist2, dist1).sum(dim=-1)
+                    # Detach dist2 to prevent double-counting gradients (standard DML practice)
+                    dist2_detached = torch.distributions.Normal(
+                        dist2.mean.detach(), dist2.stddev.detach()
+                    )
+                    kl_12 = torch.distributions.kl.kl_divergence(dist1, dist2_detached).sum(dim=-1)
+                    # For KL(p2||p1), detach dist1
+                    dist1_detached = torch.distributions.Normal(
+                        dist1.mean.detach(), dist1.stddev.detach()
+                    )
+                    kl_21 = torch.distributions.kl.kl_divergence(dist2, dist1_detached).sum(dim=-1)
                     dml_loss += (kl_12.mean() + kl_21.mean()) / 2.0
                 
                 if self.dml_loss_type in ["mse", "both"]:
                     # MSE between action means and values
+                    # Use original batch size to handle augmentation correctly
+                    action_mean1 = self.policy.action_mean[:original_batch_size]
+                    action_mean2 = self.policy2.action_mean[:original_batch_size]
                     mse_loss_fn = torch.nn.MSELoss()
-                    action_mean_loss = mse_loss_fn(self.policy.action_mean, self.policy2.action_mean)
+                    action_mean_loss = mse_loss_fn(action_mean1, action_mean2)
+                    # Ensure value shapes match
+                    if value1.shape != value2.shape:
+                        min_size = min(value1.shape[0], value2.shape[0])
+                        value1 = value1[:min_size]
+                        value2 = value2[:min_size]
                     value_loss_dml = mse_loss_fn(value1, value2)
                     dml_loss += (action_mean_loss + value_loss_dml) / 2.0
                 
@@ -438,14 +474,7 @@ class PPO:
             loss.backward()
             # -- For PPO (policy 2) - DML
             if self.policy2 is not None:
-                # Compute loss for policy2 (same structure but with policy2's predictions)
-                self.policy2.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-                actions_log_prob_batch2 = self.policy2.get_actions_log_prob(actions_batch)
-                value_batch2 = self.policy2.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
-                mu_batch2 = self.policy2.action_mean[:original_batch_size]
-                sigma_batch2 = self.policy2.action_std[:original_batch_size]
-                entropy_batch2 = self.policy2.entropy[:original_batch_size]
-                
+                # Use policy2's forward pass results computed earlier (no redundant computation)
                 # Surrogate loss for policy2
                 ratio2 = torch.exp(actions_log_prob_batch2 - torch.squeeze(old_actions_log_prob_batch))
                 surrogate2 = -torch.squeeze(advantages_batch) * ratio2
