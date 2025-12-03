@@ -71,11 +71,11 @@ class ActorCriticRecurrent(ActorCritic):
 
         # Observation encoding parameters
         self.use_position_encoding = kwargs.pop("use_position_encoding", False)
-        self.use_height_scan_encoding = kwargs.pop("use_height_scan_encoding", False)
+        self.use_height_scan_encoding = kwargs.pop("use_height_scan_encoding", True)
         self.height_scan_encoding_out_features = kwargs.pop("height_scan_encoding_out_features", 64)
 
         # Attention-based encoding parameters
-        self.use_attention_encoding = kwargs.pop("use_attention_encoding", False)
+        self.use_attention_encoding = kwargs.pop("use_attention_encoding", True)
         
         if self.use_attention_encoding:
             # Observation indices (configurable via kwargs)
