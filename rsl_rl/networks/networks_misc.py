@@ -63,24 +63,33 @@ class HeightScanEncoder(nn.Module):
         self.fc = nn.Linear(16, out_features)
         self.out_features = out_features
         
-        # Normalization parameters
+        # Normalization parameters - register as buffers to ensure correct device placement
         self.normalize = normalize
-        self.height_min = height_min  # Minimum expected height scan value
-        self.height_max = height_max  # Maximum expected height scan value
+        self.register_buffer("height_min", torch.tensor(height_min, dtype=torch.float32))
+        self.register_buffer("height_max", torch.tensor(height_max, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Normalize height scan to [-1, 1] range
         # For height scans with range [height_min, height_max], normalize to [-1, 1]:
         # normalized = 2 * (x - height_min) / (height_max - height_min) - 1
         if self.normalize:
+            # Check for NaN/Inf values that could break gradients
+            # Replace NaN/Inf with the midpoint of the expected range to prevent gradient issues
+            if torch.any(~torch.isfinite(x)):
+                midpoint = (self.height_min + self.height_max) / 2.0
+                x = torch.where(torch.isfinite(x), x, midpoint)
+            
             # Clamp to expected range first to handle outliers
             x_clamped = torch.clamp(x, min=self.height_min, max=self.height_max)
             # Normalize to [-1, 1]
             range_size = self.height_max - self.height_min
-            if range_size > 0:
+            # Use a small epsilon to avoid numerical instability with very small ranges
+            eps = 1e-8
+            if range_size > eps:
                 x_normalized = 2.0 * (x_clamped - self.height_min) / range_size - 1.0
             else:
-                x_normalized = x_clamped  # Avoid division by zero
+                # If range is too small, just center around zero
+                x_normalized = x_clamped - self.height_min
             x = x_normalized
         
         out = self.block1(x)
